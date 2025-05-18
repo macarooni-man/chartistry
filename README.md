@@ -1,2 +1,2 @@
 # clone-hero-drum-generator
-Makes drum charts with AI
+Creates Clone Hero charts from music files
