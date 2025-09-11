@@ -60,7 +60,7 @@ def main(
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            with torch.amp.autocast(device_type=device.type):
                 logits = model(x)
                 loss = crit(logits, y)
             scaler.scale(loss).backward()
@@ -71,7 +71,7 @@ def main(
 
         model.eval()
         val_loss = 0.0
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+        with torch.no_grad(), torch.amp.autocast(device_type=device.type):
             for x, y in tqdm(va_loader, desc=f"epoch {ep} [val]  ", dynamic_ncols=True):
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
