@@ -1,0 +1,19 @@
+# Core
+torch==2.4.1+cu121          # PyTorch with CUDA 12.1 build
+torchvision==0.19.1+cu121   # torchvision matching torch
+torchaudio==2.4.1+cu121     # torchaudio matching torch
+
+# Install from PyTorch’s CUDA wheel index:
+#   pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu121
+
+# Audio + DSP
+librosa==0.10.2.post1
+soundfile==0.12.1
+numpy==1.26.4
+scipy==1.13.1
+
+# Utilities
+tqdm==4.66.4
+
+# (Optional) plotting / debugging
+matplotlib==3.9.2

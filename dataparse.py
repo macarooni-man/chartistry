@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import List, Tuple, Dict, Optional
 from collections import OrderedDict
+import torchaudio.functional as AF
+import torch.nn.functional as F
 import os, glob
 import numpy as np
 import torch
 import torchaudio
-import librosa
+import librosa  # still available if you keep logmel() for utilities
 
 from chartlib import Chart, normalize_pro_drums_tick
 
@@ -17,10 +19,32 @@ window_sec = 0.64
 # sample_rate = 22050        # sample rate for features
 # n_mels      = 96           # mel bands
 # window_sec  = 1.0          # audio window centered on each grid tick (seconds)
-win_len_ms  = 23           # spectrogram frame size (ms)
-hop_ms      = 10           # spectrogram hop (ms)
+win_len_ms  = 23            # spectrogram frame size (ms)
+hop_ms      = 10            # spectrogram hop (ms)
 
 _AUDIO_EXTS = (".wav", ".ogg", ".mp3", ".flac", ".m4a")
+
+def _nearest_pow2(n: int) -> int:
+    return 1 << (int(n - 1).bit_length())
+
+def mel_config():
+    """
+    Single source of truth for mel parameters.
+    Trainer will import this so we never diverge.
+    """
+    n_fft_est = int(round(sample_rate * win_len_ms / 1000))
+    n_fft = _nearest_pow2(n_fft_est)                   # e.g., 507 -> 512
+    return {
+        "sample_rate": sample_rate,
+        "n_fft": n_fft,
+        "hop_length": int(sample_rate * hop_ms / 1000),
+        "n_mels": n_mels,
+        "f_min": 20.0,                                 # avoids zeroed low bands
+        "f_max": None,                                 # None => sr/2
+        "power": 2.0,
+        "norm": "slaney",
+        "mel_scale": "htk",
+    }
 
 def _ms_to_samples(ms: float) -> int:
     return int(round(ms * sample_rate / 1000.0))
@@ -28,6 +52,7 @@ def _ms_to_samples(ms: float) -> int:
 def logmel(y: np.ndarray) -> np.ndarray:
     """
     Log-mel spectrogram (a "picture of sound": time × frequency with log energy).
+    (Utility; not used in the fast training path.)
     """
     S = librosa.feature.melspectrogram(
         y=y, sr=sample_rate,
@@ -40,7 +65,7 @@ def logmel(y: np.ndarray) -> np.ndarray:
 
 def label_vector_from_notes_at_tick(notes_at_tick) -> np.ndarray:
     """
-    Convert raw notes at a tick into an 8-dim multi-label vector:
+    (Legacy utility.) Convert raw notes at a tick into an 8-dim multi-label vector:
     [K, R, Y, B, G, Yc, Bc, Gc]
     """
     d = normalize_pro_drums_tick(notes_at_tick)
@@ -54,6 +79,20 @@ def label_vector_from_notes_at_tick(notes_at_tick) -> np.ndarray:
         1.0 if d["cymbal_b"] else 0.0,
         1.0 if d["cymbal_g"] else 0.0,
     ], dtype=np.float32)
+
+# Fast label builder (used in precompute)
+def _label_from_lanes(lanes: set[int]) -> torch.Tensor:
+    # [K, R, Y, B, G, Yc, Bc, Gc]
+    return torch.tensor([
+        1.0 if 0 in lanes  else 0.0,
+        1.0 if 1 in lanes  else 0.0,
+        1.0 if 2 in lanes  else 0.0,
+        1.0 if 3 in lanes  else 0.0,
+        1.0 if 4 in lanes  else 0.0,
+        1.0 if 66 in lanes else 0.0,
+        1.0 if 67 in lanes else 0.0,
+        1.0 if 68 in lanes else 0.0,
+    ], dtype=torch.float32)
 
 # ───────────────────────── robust discovery ─────────────────────────
 
@@ -100,30 +139,40 @@ def discover_song_dirs(root: str, recursive: bool = False) -> list[str]:
 
     return sorted(songs)
 
-# ───────────────────────── fast dataset (flat index + LRU audio) ─────────────────────────
+# ───────────────────────── fast dataset (flat index + LRU audio + precomputed labels) ─────────────────────────
 
 class _LRUAudioCache(OrderedDict):
     def __init__(self, max_items: int = 2):
         super().__init__(); self.max_items = max_items
-    def get_audio(self, path: str) -> np.ndarray:
+
+    def get_audio(self, path: str) -> torch.Tensor:
+        """
+        Return a 1D torch.float32 tensor at target sample_rate.
+        Cached as a torch tensor to avoid numpy round-trips.
+        """
         if path in self:
-            y = super().pop(path)        # move to end (most-recent)
+            y = super().pop(path)
             super().__setitem__(path, y)
             return y
-        wav, sr = torchaudio.load(path)  # [C, N]
-        y = wav.mean(dim=0).numpy()
+
+        wav, sr = torchaudio.load(path)          # [C, N], torch.float32
+        y = wav.mean(dim=0)                      # [N] mono
+
         if sr != sample_rate:
-            y = librosa.resample(y, orig_sr=sr, target_sr=sample_rate)
+            # fast, vectorized resample in torch
+            y = AF.resample(y, orig_freq=sr, new_freq=sample_rate)
+
+        y = y.contiguous()                       # slicing friendly
         super().__setitem__(path, y)
         if len(self) > self.max_items:
-            self.popitem(last=False)     # evict least-recent
+            self.popitem(last=False)
         return y
 
 class DrumGridDataset(torch.utils.data.Dataset):
     """
     One item corresponds to one grid tick (default 48th notes):
-      X: log-mel spectrogram for a 1.0s window around the tick  → torch.FloatTensor [1, N_MELS, T]
-      y: 8-dim multi-label vector                               → torch.FloatTensor [8]
+      X: raw mono waveform window centered on the grid tick → torch.FloatTensor [1, T]
+      y: 8-dim multi-label vector                           → torch.FloatTensor [8]
 
     Expected folder layout per song:
       <song_dir>/notes.chart (or any *.chart)
@@ -149,10 +198,12 @@ class DrumGridDataset(torch.utils.data.Dataset):
         if limit_songs is not None:
             song_dirs = song_dirs[:limit_songs]
 
-        # per-song data
-        self._chart: Dict[str, Chart] = {}
-        self._audio_path: Dict[str, str] = {}
+        # per-song state
+        self._chart: Dict[str, Chart]      = {}
+        self._audio_path: Dict[str, str]   = {}
         self._grid_ticks: Dict[str, List[int]] = {}
+        self._labels: Dict[str, List[torch.Tensor]] = {}
+        self._tick_pos: Dict[str, Dict[int, int]] = {}       # tick -> local index
 
         # global flat index: list of (song_dir, tick)
         self.index: List[Tuple[str, int]] = []
@@ -182,6 +233,28 @@ class DrumGridDataset(torch.utils.data.Dataset):
             if limit_ticks is not None:
                 ticks = ticks[:limit_ticks]
             self._grid_ticks[d] = ticks
+            self._tick_pos[d]   = {t: i for i, t in enumerate(ticks)}
+
+            # ----- PRECOMPUTE LABELS FOR THESE TICKS (O(n) once) -----
+            step = ch.resolution // round(self.subdivision / 4)
+            tol_ticks = max(1, step // 2)
+
+            note_list = []
+            if self.track_hint in ch.tracks:
+                note_list = sorted(ch.tracks[self.track_hint].notes, key=lambda n: n.tick)
+            note_ticks = [n.tick for n in note_list]
+
+            import bisect as _bisect
+            labels: List[torch.Tensor] = []
+            for t in ticks:
+                left  = _bisect.bisect_left(note_ticks, t - tol_ticks)
+                right = _bisect.bisect_right(note_ticks, t + tol_ticks)
+                lanes: set[int] = set()
+                for i in range(left, right):
+                    lanes.add(note_list[i].lane)
+                labels.append(_label_from_lanes(lanes))
+            self._labels[d] = labels
+            # ---------------------------------------------------------
 
             # extend flat index
             self.index.extend((d, t) for t in ticks)
@@ -194,46 +267,33 @@ class DrumGridDataset(torch.utils.data.Dataset):
         return len(self.index)
 
     # internal helpers
-    def _audio_for(self, song_dir: str) -> np.ndarray:
+    def _audio_for(self, song_dir: str) -> torch.Tensor:
         return self._cache.get_audio(self._audio_path[song_dir])
 
     def __getitem__(self, index: int):
         song_dir, tick = self.index[index]
         ch = self._chart[song_dir]
-        y  = self._audio_for(song_dir)
+        y  = self._audio_for(song_dir)  # torch.Tensor [N]
 
-        # Center time (ms) at this grid tick using the chart's internal TempoMap
+        # Center time in ms
         center_ms = ch.tick_to_ms(tick)
-
-        # Extract a centered window
         half_ms = (window_sec * 1000.0) / 2.0
         start_ms = max(0.0, center_ms - half_ms)
-        end_ms   = min(len(y) * 1000.0 / sample_rate, center_ms + half_ms)
+        end_ms   = min(y.numel() * 1000.0 / sample_rate, center_ms + half_ms)
 
-        s = _ms_to_samples(start_ms)
-        e = _ms_to_samples(end_ms)
-        y_win = y[s:e]
+        s = int(round(start_ms * sample_rate / 1000.0))
+        e = int(round(end_ms   * sample_rate / 1000.0))
+        y_win = y[s:e]  # torch slice
 
-        # Pad to fixed length (begin/end of file)
-        need = _ms_to_samples(2 * half_ms) - len(y_win)
+        # Pad to fixed length with zeros (right pad)
+        need = int(round(2 * half_ms * sample_rate / 1000.0)) - y_win.numel()
         if need > 0:
-            y_win = np.pad(y_win, (0, need))
+            y_win = F.pad(y_win, (0, need))
 
-        # Features
-        S = logmel(y_win)        # [N_MELS, T]
-        S = S[None, ...]         # [1, N_MELS, T] — single "channel"
+        x = y_win.unsqueeze(0)  # [1, T] torch.float32
 
-        # Labels: any note within ± half a grid step counts for this grid cell
-        step = ch.resolution // round(self.subdivision / 4)  # your build_grid_ticks convention
-        tol_ticks = max(1, step // 2)
+        # O(1) label fetch aligned with tick list
+        li = self._tick_pos[song_dir][tick]
+        y_vec = self._labels[song_dir][li]       # torch.FloatTensor [8]
 
-        # Collect nearby notes from the hinted track (if present); else empty
-        notes = []
-        if self.track_hint in ch.tracks:
-            # (iterate local list is fine — per-song, not per-item scanning anymore)
-            for n in ch.tracks[self.track_hint].notes:
-                if abs(n.tick - tick) <= tol_ticks:
-                    notes.append(n)
-
-        y_vec = label_vector_from_notes_at_tick(notes)  # [8]
-        return torch.from_numpy(S), torch.from_numpy(y_vec)
+        return x, y_vec

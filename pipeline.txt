@@ -1,0 +1,8 @@
+# Precompute data from the charts and audio files
+python precompute.py --data_root .\dataset
+
+# Train the model
+python trainer.py --data_root .\dataset
+
+# Export a file from the generated model
+python export_chart.py "./dataset/KChG - Mirage" --ckpt drum48_best.pt --thr 0.08 0.08 0.10 0.08 0.08 0.10 0.08 0.08 --smooth 1
